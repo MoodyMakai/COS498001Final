@@ -1,0 +1,298 @@
+================================================================================
+RUNNING THE NLP PIPELINE IN GOOGLE COLAB + EXPLANATION OF HOW IT WORKS
+================================================================================
+
+
+PART 1 — RUNNING IN GOOGLE COLAB
+================================================================================
+
+ONE-TIME SETUP (do this once, ever)
+-----------------------------------
+
+1. Go to kaggle.com -> click your avatar -> Settings -> scroll to API ->
+   click "Create New Token". This downloads a kaggle.json file. Keep it
+   somewhere — you'll upload it to Colab in step 4 below.
+
+
+PER-SESSION BOOTSTRAP (every time you start a new Colab)
+--------------------------------------------------------
+
+1. Open https://colab.research.google.com -> New notebook.
+
+2. Set the runtime to GPU:
+   Top menu -> Runtime -> Change runtime type -> T4 GPU -> Save.
+   (Free tier is fine. Notebooks 05 and 06 need GPU; the rest don't care.)
+
+3. Paste this into the FIRST cell of the new Colab notebook and run it:
+
+   --- begin cell ---
+   # Clone your repo
+   !git clone https://github.com/MoodyMakai/COS498001Final.git
+   %cd COS498001Final/code
+
+   # Install Python dependencies (3-5 min)
+   !pip install -q -r requirements.txt
+   !python -m spacy download en_core_web_sm
+   import nltk
+   for r in ["vader_lexicon", "stopwords", "punkt"]:
+       nltk.download(r, quiet=True)
+   --- end cell ---
+
+4. Upload kaggle.json and download the dataset.
+   Paste this into a SECOND cell:
+
+   --- begin cell ---
+   from google.colab import files
+   files.upload()                    # pick kaggle.json from your machine
+   !mkdir -p ~/.kaggle && mv kaggle.json ~/.kaggle/ && chmod 600 ~/.kaggle/kaggle.json
+
+   !kaggle datasets download -d kritanjalijain/amazon-reviews -p data/raw
+   !cd data/raw && unzip -o "*.zip" && rm *.zip
+   !ls -lh data/raw
+   --- end cell ---
+
+   You should see train.csv (~1.6 GB) and test.csv inside data/raw/.
+
+5. Open the project notebooks. In Colab's left sidebar, expand the file tree:
+   COS498001Final/code/. Double-click 00_setup_and_data_audit.ipynb.
+   Run all cells (Runtime -> Run all). Then open 01_..., run all.
+   Continue through 08_... in order.
+
+
+OPTIONAL — MAKE ARTIFACTS SURVIVE BETWEEN SESSIONS
+--------------------------------------------------
+
+Colab wipes /content when the runtime stops. If you want models and parquet
+files to persist, mount Google Drive BEFORE step 3 above:
+
+   --- begin cell ---
+   from google.colab import drive
+   drive.mount('/content/drive')
+   !mkdir -p /content/drive/MyDrive/COS498001Final
+   %cd /content/drive/MyDrive/COS498001Final
+   # then clone into the cwd:
+   !git clone https://github.com/MoodyMakai/COS498001Final.git . 2>/dev/null || git pull
+   %cd code
+   --- end cell ---
+
+Everything in data/artifacts/, figures/, and the fine-tuned model will then
+live in your Drive.
+
+
+WHAT TO SKIP IF YOU'RE SHORT ON TIME
+------------------------------------
+
+- Notebook 05 (DistilBERT) is the only one that takes meaningful GPU time
+  (~30-45 min on T4). Skip it for an early demo and re-run later.
+
+- Notebook 06 (zero-shot) is GPU-heavy too. The default sample is 2,000
+  reviews — keep it small for the first pass; bump it for the final report.
+
+- The lexicon + classical-ML tier (notebooks 00 -> 04) runs CPU-only in
+  under 10 minutes total and gives you a complete baseline result.
+
+
+
+PART 2 — HOW THE CODE WORKS
+================================================================================
+
+BIG-PICTURE ARCHITECTURE
+------------------------
+
+The pipeline mirrors the three-tier sentiment methodology of the koosha-t
+reference repo: lexicon -> classical ML -> neural transformer. Each tier
+is independent and progressively more accurate (and more expensive). On top
+of those three tiers, two original contributions extend the analysis:
+
+- Zero-shot desire categories — labels each review along six dimensions
+  (status-seeking, FOMO, genuine-need, social-pressure, hedonic-impulse,
+  ad-language-echo) without any supervised training.
+- BERTopic topic modeling — clusters reviews by emergent themes for
+  unsupervised discovery.
+
+Data flows through nine notebooks as parquet/numpy artifacts in
+data/artifacts/. Each notebook reads its predecessor's output, does one
+stage, writes its own output. That decoupling is deliberate: you can re-run
+notebook 04 without rerunning 01-03.
+
+   00 audit -> 01 split -> 02 features -+-> 03 lexicon ----+
+                                        +-> 04 classical --+
+                                        +-> 05 neural -----+--> 08 evaluation
+                                        +-> 06 zero-shot --+
+                                        +-> 07 topics -----+
+
+
+WHAT EACH NOTEBOOK DOES AND WHY
+-------------------------------
+
+00_setup_and_data_audit.ipynb
+   Loads the raw CSV with Polars (faster than Pandas at this scale), prints
+   shape/schema/polarity-balance/length-distribution, saves
+   figures/00_data_audit.png. Critical because the project brief disagrees
+   with the actual Kaggle file size — this notebook tells you what you
+   really have. Output: nothing, just observations to copy into the LaTeX
+   Dataset section.
+
+01_preprocessing_and_sampling.ipynb
+   Three jobs:
+   (1) light text cleaning (lowercase, remove URLs, normalize whitespace),
+   (2) build three stratified random samples (100K / 200K / 500K rows)
+       preserving the polarity balance,
+   (3) split the 200K "neural" sample into 80% train / 10% val / 10% test.
+   Outputs: split_train.parquet, split_val.parquet, split_test.parquet.
+   ALL LATER NOTEBOOKS USE THESE SPLITS.
+
+02_feature_extraction.ipynb
+   Two parallel views of the same text:
+   (1) TF-IDF (sparse, 1- and 2-grams, sublinear TF) — fed into the
+       classical-ML tier.
+   (2) Sentence embeddings from all-MiniLM-L6-v2 (dense, 384-dim per
+       review) — fed into BERTopic and reused for similarity work.
+   Why two views: TF-IDF is interpretable and CPU-cheap; embeddings carry
+   semantic meaning that TF-IDF can't.
+   Outputs: tfidf_*.npz, emb_*.npy, tfidf_vectorizer.joblib.
+
+03_lexicon_tier.ipynb
+   The reference repo's tier 1, expanded. Runs:
+   - VADER (compound polarity score)
+   - AFINN (independent polarity baseline)
+   - optionally NRC EmoLex (8 Plutchik emotions: anger, fear, joy, etc.)
+   over each test-set review. Builds the per-review desire signature — a
+   numeric vector capturing polarity, valence, and emotional content.
+   Reports a quick lexicon-only accuracy as the floor for the other tiers
+   to beat.
+   Outputs: lexicon_signature_test.parquet, metrics_lexicon_vader.json,
+            figures/03_lexicon_signature_means.png (heatmap of mean
+            signature per polarity class).
+
+04_classical_ml_tier.ipynb
+   Three classical models on the TF-IDF features in a clean ablation:
+   LogisticRegression -> LinearSVC -> LightGBM. Each is evaluated with
+   accuracy, macro-F1, per-class F1, and ROC-AUC. The notebook also:
+   - extracts the top-20 most positive/negative TF-IDF features from
+     LogReg (interpretability),
+   - runs an imbalanced-learn RandomUnderSampler comparison (per the
+     reference repo's imblearn requirement),
+   - saves the best of the three as a joblib pickle.
+   Outputs: metrics_classical_ml.json, classical_top_features.csv,
+            figures/04_classical_confusion.png.
+
+05_neural_tier_finetune.ipynb
+   Fine-tunes distilbert-base-uncased via the HuggingFace Trainer API on
+   a 20K-row subset of the train split for 2 epochs.
+   Why DistilBERT and not BERT-base: 40% smaller, runs on a free Colab T4
+   in well under an hour, retains ~97% of BERT-base's accuracy.
+   Why the subset: the full 160K-row train split would be ~5x slower for
+   marginal gain at this stage.
+   Output: a saved fine-tuned model under data/artifacts/distilbert_final/
+           and metrics_neural_distilbert.json.
+   THIS IS WHERE THE PROJECT BEATS THE REFERENCE REPO ON TEST-SET F1,
+   because DistilBERT has world-knowledge the classical TF-IDF models
+   can't access.
+
+06_zero_shot_desire_categories.ipynb
+   THE HEADLINE ORIGINAL CONTRIBUTION.
+   Loads MoritzLaurer/deberta-v3-base-zeroshot-v2.0 (a DeBERTa-v3 model
+   fine-tuned on natural language inference data), and uses HuggingFace's
+   zero-shot-classification pipeline to label each review with
+   probabilities across six candidate categories:
+       status seeking, fear of missing out, genuine need,
+       social pressure, hedonic impulse, advertising language echo.
+   NO TRAINING DATA NEEDED — the model treats each label as a hypothesis
+   ("This text expresses status seeking") and computes entailment
+   probability.
+   The notebook then cross-tabulates these probabilities against the
+   polarity label, producing the project's signature heatmap
+   (figures/06_zeroshot_desire_by_polarity.png) showing which desire
+   categories are loaded onto positive vs. negative reviews.
+   Multi-label is on, so a review can score high on both "FOMO" and
+   "social-pressure" simultaneously.
+   Outputs: zeroshot_desire.parquet, zeroshot_examples.json (top-3 reviews
+            per category — great Appendix material).
+
+07_topic_modeling.ipynb
+   Unsupervised theme discovery. Reuses the cached embeddings from
+   notebook 02, feeds them into BERTopic (which internally runs UMAP for
+   dim-reduction + HDBSCAN for clustering + class-based TF-IDF for topic
+   naming), then computes per-topic mean polarity to surface which themes
+   load most heavily on positive (high-desire) vs. negative reviews. Adds
+   KeyBERT for sharper per-cluster keywords and a brief Gensim LDA pass
+   on the same data as a comparison baseline (so the report can argue
+   "BERTopic produces tighter, more interpretable clusters than LDA on
+   this corpus").
+   Outputs: bertopic_topic_info.csv, bertopic_polarity_per_topic.csv,
+            topics_test.parquet.
+
+08_evaluation_and_figures.ipynb
+   The "compile everything" notebook. Reads every metrics_*.json file
+   from data/artifacts/, builds a single cross-tier comparison DataFrame
+   (lexicon vs. classical vs. neural), produces the headline accuracy bar
+   chart (figures/08_tier_comparison.png), and exports a markdown table
+   ready to paste into the LaTeX Results section.
+   Output: final_comparison.csv, final_results_table.md.
+
+
+HOW THE PIECES FIT TOGETHER
+---------------------------
+
+The output you'll show in the report is essentially a per-review feature
+vector:
+
+   Source                   Dims  Captures
+   --------                 ----  --------
+   VADER                       4  compound, pos, neg, neu — polarity
+   AFINN                       2  raw + length-normalized polarity
+   NRC EmoLex (optional)       8  Plutchik-8 emotions
+   Zero-shot DeBERTa           6  desire categories (status, FOMO, etc.)
+   BERTopic                    1+ topic ID + per-topic stats
+   DistilBERT logits           1  supervised positive-class confidence
+
+That's a ~20-dimensional fingerprint of what each review reveals about
+WANTING. The LaTeX Methodology section describes how it's built;
+Results reports per-tier accuracy/F1; Discussion uses the zero-shot
+heatmap and topic table to interpret what kinds of language drive desire
+on Amazon.
+
+
+WHERE THIS PROJECT GOES BEYOND THE REFERENCE REPO
+-------------------------------------------------
+
+   koosha-t reference repo            This project
+   ----------------------------       --------------------------------
+   VADER only (lexicon)               VADER + AFINN + optional NRC EmoLex
+   LogReg / NB / RF / SVM             LogReg / LinearSVC / LightGBM
+   BERT (full)                        DistilBERT (faster, free-tier OK)
+   Binary sentiment only              + 6-way zero-shot desire categories
+                                        (no training data)
+   No topic modeling                  + BERTopic with KeyBERT + LDA
+                                        comparison
+   Standard metrics only              + per-topic polarity, class-
+                                        conditional signature heatmap
+
+
+COMMON PITFALLS
+---------------
+
+- Kaggle 401 error
+  kaggle.json not in ~/.kaggle/ or wrong permissions. Re-run the
+  chmod 600 line.
+
+- CUDA out-of-memory in notebook 05
+  Drop BATCH_SIZE from 16 to 8 and max_length from 192 to 128.
+
+- Notebook 06 painfully slow
+  You're on CPU. Either set Runtime -> T4 GPU (5-10x speedup) or
+  shrink N_SAMPLE to 500.
+
+- utils.find_amazon_csv() returns None
+  The CSV isn't where it's expected. Run !ls code/data/raw/ to confirm
+  train.csv lives there.
+
+- Polars / Pandas mismatch errors
+  Polars is much faster but its API differs. The notebooks convert to
+  Pandas where needed; if you edit, watch for the boundary.
+
+
+================================================================================
+END OF GUIDE
+================================================================================
